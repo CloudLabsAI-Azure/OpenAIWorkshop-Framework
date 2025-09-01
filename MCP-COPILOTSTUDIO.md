@@ -131,6 +131,7 @@ host: YOUR_ACTUAL_TUNNEL_URL.use.devtunnels.ms
    - Choose **"Import from an OpenAPI file"**
 
 3. **Upload OpenAPI Specification**:
+   - Rename the `crm-mcp-connector.template` file to `crm-mcp-connector` and edit the host details
    - Upload the `crm-mcp-connector.yaml` file
    - Refresh and connect the newly added mcp tool in copilot studio
 
