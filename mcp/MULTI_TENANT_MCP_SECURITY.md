@@ -1,7 +1,7 @@
 # Multi‑Tenant MCP Service Access Design  
   
 ## **Business Goal**  
-We want to **expose a company’s MCP (Managed Control Platform) services** to **external customer organizations** so their users can consume these services securely.  
+We want to **expose a company’s MCP (Model Context Proctol) services** to **external customer organizations** so their users can consume these services securely.  
   
 - **Multi‑tenant**: Many customer organizations (tenants) can use the same platform.  
 - **Role-based access**: Customer tenant admins assign roles to their users.  
