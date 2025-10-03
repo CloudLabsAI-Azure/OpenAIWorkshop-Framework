@@ -38,14 +38,10 @@ In this part, you will configure and run the backend service for the Microsoft A
 ### 1. Configure Agent Framework
 
 > **Action Items:**
-> Configure the agent type in your `.env` file within the `agentic_ai/applications` folder. Uncomment one of the following lines:
+> Configure the agent type in your `.env` file within the `agentic_ai/applications` folder. This will already have some of your Azure OpenAI settings from Part 0. This will be the type of agent as described above. Make sure to choose the appropriate agent module for your use case:
 > ```bash
-> # In your .env file in agentic_ai/applications folder, uncomment one of following for agent framework:
+> # In your .env file in agentic_ai/applications folder, specify which type of agent for agent framework:
 > AGENT_MODULE="agents.agent_framework.single_agent"
-> # OR
-> AGENT_MODULE="agents.agent_framework.multi_agent.magentic_group"
-> # OR
-> AGENT_MODULE="agents.agent_framework.multi_agent.handoff_multi_domain_agent"
 > ```
 > 
 > Add additional environment variables to the bottom of your existing `.env` file:
@@ -62,7 +58,7 @@ In this part, you will configure and run the backend service for the Microsoft A
 > HANDOFF_CONTEXT_TRANSFER_TURNS=-1  # -1=all history, 0=none, N=last N turns
 > ```
 
-📚 **[See detailed pattern guide and configuration →](../agentic_ai/agents/agent_framework/README.md)**
+📚 **[See detailed pattern guide and configuration for Agent Framework→](../agentic_ai/agents/agent_framework/README.md)**
 
 ### 2. Run Backend Service
 
