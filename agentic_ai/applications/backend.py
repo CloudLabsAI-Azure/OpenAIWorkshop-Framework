@@ -26,7 +26,7 @@ from fastapi import FastAPI, Depends, Header, WebSocket, WebSocketDisconnect
 load_dotenv()  # read .env if present  
 
 # Feature flag: disable auth for local dev / demos
-DISABLE_AUTH = os.getenv("DISABLE_AUTH", "false").lower() in ("1", "true", "yes")
+DISABLE_AUTH = os.getenv("DISABLE_AUTH", "true").lower() in ("1", "true", "yes")
 
 if DISABLE_AUTH:
     AAD_TENANT_ID = None
