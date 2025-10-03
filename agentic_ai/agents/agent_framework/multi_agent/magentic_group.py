@@ -23,6 +23,7 @@ from agent_framework import (
 from agent_framework.azure import AzureOpenAIChatClient  # type: ignore[import]
 
 from agents.base_agent import BaseAgent
+from agents.agent_framework.utils import create_filtered_tool_list
 
 logger = logging.getLogger(__name__)
 
@@ -468,9 +469,14 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
         participant_client: AzureOpenAIChatClient,
         tools: Iterable[MCPStreamableHTTPTool] | None,
     ) -> Dict[str, ChatAgent]:
-        # CRITICAL: ChatAgent expects a single MCPStreamableHTTPTool, not a list
-        shared_tool = tools[0] if tools else None
-        logger.info(f"[MCP PARTICIPANTS] Creating participants with shared_tool: {shared_tool}")
+        # Get base MCP tool (connect once, filter per agent)
+        base_mcp_tool = tools[0] if tools else None
+        logger.info(f"[MCP PARTICIPANTS] Creating participants with base MCP tool: {base_mcp_tool}")
+        
+        # CRITICAL: Connect to MCP server BEFORE filtering to load all available tools
+        if base_mcp_tool:
+            await base_mcp_tool.__aenter__()
+            logger.info(f"[MCP PARTICIPANTS] Connected to MCP server, loaded {len(base_mcp_tool.functions)} tools")
         
         base_definitions: Dict[str, Dict[str, Any]] = {
             "crm_billing": {
@@ -478,6 +484,17 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
                 "description": (
                     "Agent specializing in customer account, subscription, billing inquiries, invoices, payments, and related policy checks."
                 ),
+                "tools": [
+                    "get_all_customers",
+                    "get_customer_detail",
+                    "get_subscription_detail",
+                    "get_billing_summary",
+                    "get_invoice_payments",
+                    "pay_invoice",
+                    "get_data_usage",
+                    "update_subscription",
+                    "search_knowledge_base",
+                ],
                 "instructions": (
                     "You are the CRM & Billing **internal specialist**.\n"
                     "**CRITICAL: You communicate ONLY with the orchestrator, NOT directly with the customer.**\n"
@@ -498,6 +515,14 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
                 "description": (
                     "Agent for retrieving and explaining product availability, promotions, discounts, eligibility, and terms."
                 ),
+                "tools": [
+                    "get_products",
+                    "get_product_detail",
+                    "get_promotions",
+                    "get_eligible_promotions",
+                    "get_customer_orders",
+                    "search_knowledge_base",
+                ],
                 "instructions": (
                     "You are the Product & Promotions **internal specialist**.\n"
                     "**CRITICAL: You communicate ONLY with the orchestrator, NOT directly with the customer.**\n"
@@ -517,6 +542,13 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
                 "description": (
                     "Agent focusing on security incidents, authentication issues, lockouts, and risk mitigation guidance."
                 ),
+                "tools": [
+                    "get_security_logs",
+                    "unlock_account",
+                    "get_support_tickets",
+                    "create_support_ticket",
+                    "search_knowledge_base",
+                ],
                 "instructions": (
                     "You are the Security & Authentication **internal specialist**.\n"
                     "**CRITICAL: You communicate ONLY with the orchestrator, NOT directly with the customer.**\n"
@@ -539,21 +571,28 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
                 "chat_client": participant_client,
                 "model": self.openai_model_name,
             }
-            if shared_tool is not None and "tools" not in agent_kwargs:
-                agent_kwargs["tools"] = shared_tool
-                logger.info(f"[MCP PARTICIPANTS] Assigning MCP tool to agent '{participant_id}'")
+            
+            # Apply tool filtering for this participant's domain
+            if base_mcp_tool is not None and "tools" in defaults:
+                filtered_tools = create_filtered_tool_list(
+                    base_mcp_tool=base_mcp_tool,
+                    allowed_tool_names=defaults["tools"],
+                    agent_name=participant_id
+                )
+                if filtered_tools:
+                    agent_kwargs["tools"] = filtered_tools
+                    logger.info(f"[MCP PARTICIPANTS] Assigned {len(filtered_tools)} filtered tools to agent '{participant_id}'")
+            elif base_mcp_tool is not None and "tools" not in agent_kwargs:
+                # Fallback: if no tool list defined, give all tools
+                agent_kwargs["tools"] = base_mcp_tool
+                logger.warning(f"[MCP PARTICIPANTS] No tool filter for '{participant_id}', using all tools")
 
             merged_kwargs = self._apply_participant_overrides(participant_id, agent_kwargs)
             agent = ChatAgent(**merged_kwargs)
             
-            # CRITICAL: Initialize the MCP tool session just like single_agent.py does
-            if shared_tool is not None:
-                try:
-                    await agent.__aenter__()
-                    logger.info(f"[MCP PARTICIPANTS] Initialized MCP session for agent '{participant_id}'")
-                except Exception as exc:
-                    logger.error(f"[MCP PARTICIPANTS] Failed to initialize MCP session for '{participant_id}': {exc}")
-                    raise
+            # Initialize agent session (MCP tool already connected above)
+            await agent.__aenter__()
+            logger.info(f"[MCP PARTICIPANTS] Initialized agent session for '{participant_id}'")
             
             participants[participant_id] = agent
 

@@ -16,14 +16,38 @@ Key improvements over v2:
 
 import json
 import logging
+import os
+import random
+import re
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
 from agent_framework import ChatAgent, ChatMessage, Role, MCPStreamableHTTPTool
 from agent_framework.azure import AzureOpenAIChatClient
 
 from agents.base_agent import BaseAgent
+from agents.agent_framework.utils import create_filtered_tool_list
 
 logger = logging.getLogger(__name__)
+
+
+# Pydantic model for structured intent classification output
+class IntentClassification(BaseModel):
+    """Structured output for intent classification."""
+    domain: str = Field(
+        description="Target domain: crm_billing, product_promotions, or security_authentication"
+    )
+    is_domain_change: bool = Field(
+        description="Whether this represents a change from the current domain"
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Confidence score between 0.0 and 1.0"
+    )
+    reasoning: str = Field(
+        description="Brief explanation of the classification decision"
+    )
 
 
 # Domain definitions
@@ -50,7 +74,7 @@ DOMAINS = {
             "**Critical rules:**\n"
             "- ALWAYS use your tools to retrieve factual data. NEVER guess or hallucinate.\n"
             "- If customer info is needed but not provided, ask the user directly for it.\n"
-            "- If the user asks about products, promotions, or security issues, respond: "
+            "- If the user asks about products, promotions, or security issues, you MUST respond with this EXACT phrase: "
             "'This is outside my area. Let me connect you with the right specialist.'\n"
             "- Be concise and professional. Provide specific details from tool responses.\n"
         ),
@@ -74,7 +98,7 @@ DOMAINS = {
             "- Customer orders and product recommendations\n\n"
             "**Critical rules:**\n"
             "- ALWAYS use your tools to retrieve factual data. NEVER guess or hallucinate.\n"
-            "- If the user asks about billing or security issues, respond: "
+            "- If the user asks about billing or security issues, you MUST respond with this EXACT phrase: "
             "'This is outside my area. Let me connect you with the right specialist.'\n"
             "- Be enthusiastic and helpful. Highlight benefits and savings opportunities.\n"
         ),
@@ -97,7 +121,7 @@ DOMAINS = {
             "- Support ticket management for security issues\n\n"
             "**Critical rules:**\n"
             "- ALWAYS use your tools to retrieve factual data. NEVER guess or hallucinate.\n"
-            "- If the user asks about billing or products, respond: "
+            "- If the user asks about billing or products, you MUST respond with this EXACT phrase: "
             "'This is outside my area. Let me connect you with the right specialist.'\n"
             "- Take security seriously. Verify user identity and flag suspicious activity.\n"
         ),
@@ -161,8 +185,69 @@ class Agent(BaseAgent):
         self._current_turn = state_store.get(self._turn_key, 0)
         
         # Context transfer configuration: -1 = all history, 0 = none, N = last N turns
-        import os
         self._context_transfer_turns = int(os.getenv("HANDOFF_CONTEXT_TRANSFER_TURNS", "-1"))
+        
+        # Lazy classification configuration
+        self._lazy_classification = os.getenv("HANDOFF_LAZY_CLASSIFICATION", "true").lower() == "true"
+        self._default_domain = os.getenv("HANDOFF_DEFAULT_DOMAIN", "crm_billing")
+        
+        logger.info(
+            f"[HANDOFF] Configuration: lazy_classification={self._lazy_classification}, "
+            f"default_domain={self._default_domain}, context_transfer_turns={self._context_transfer_turns}"
+        )
+
+    def _detect_handoff_request(self, response_text: str) -> bool:
+        """
+        Detect if the agent response contains a handoff request using pattern matching.
+        
+        This avoids the need for LLM-based detection by looking for key phrases that
+        agents are instructed to use when a request is outside their domain.
+        
+        Args:
+            response_text: The agent's response text
+            
+        Returns:
+            True if handoff is requested, False otherwise
+        """
+        # Normalize text for matching
+        normalized = response_text.lower()
+        
+        # Define handoff patterns (in order of specificity)
+        handoff_patterns = [
+            r"outside my area.*connect you with.*specialist",  # Exact template match
+            r"outside my (domain|expertise|area)",  # Domain boundary indication
+            r"connect you with.*specialist",  # Explicit handoff language
+            r"let me (transfer|route|connect) you",  # Transfer language
+            r"not my (specialty|expertise|domain)",  # Boundary indication
+            r"better suited to help",  # Redirection language
+        ]
+        
+        # Check each pattern
+        for pattern in handoff_patterns:
+            if re.search(pattern, normalized):
+                logger.info(f"[HANDOFF] Detected handoff request with pattern: {pattern}")
+
+                return True
+        
+        # Additional keyword-based detection with proximity check
+        keywords_group1 = ["outside", "not my"]
+        keywords_group2 = ["area", "domain", "expertise", "specialty"]
+        keywords_group3 = ["connect", "transfer", "specialist", "help"]
+        
+        # Check if keywords from different groups appear within reasonable distance (100 chars)
+        for kw1 in keywords_group1:
+            if kw1 in normalized:
+                start_pos = normalized.find(kw1)
+                window = normalized[start_pos:start_pos + 100]
+                
+                has_group2 = any(kw2 in window for kw2 in keywords_group2)
+                has_group3 = any(kw3 in window for kw3 in keywords_group3)
+                
+                if has_group2 and has_group3:
+                    logger.info(f"[HANDOFF] Detected handoff via keyword proximity: {kw1} + groups 2&3")
+
+                    return True
+        return False
 
     def set_websocket_manager(self, manager: Any) -> None:
         """Allow backend to inject WebSocket manager for streaming events."""
@@ -170,7 +255,7 @@ class Agent(BaseAgent):
         logger.info(f"[HANDOFF] WebSocket manager set for handoff agent, session_id={self.session_id}")
 
     async def _setup_agents(self) -> None:
-        """Initialize all domain specialist agents."""
+        """Initialize all domain specialist agents with filtered MCP tools."""
         if self._initialized:
             return
 
@@ -181,7 +266,12 @@ class Agent(BaseAgent):
             )
 
         headers = self._build_headers()
-        mcp_tool = await self._create_mcp_tool(headers)
+        base_mcp_tool = await self._create_mcp_tool(headers)
+
+        # Connect to MCP server once to load all available tools
+        if base_mcp_tool:
+            await base_mcp_tool.__aenter__()
+            logger.info(f"[HANDOFF] Connected to MCP server, loaded {len(base_mcp_tool.functions)} tools")
 
         chat_client = AzureOpenAIChatClient(
             api_key=self.azure_openai_key,
@@ -190,13 +280,20 @@ class Agent(BaseAgent):
             api_version=self.api_version,
         )
 
-        # Create all domain specialist agents
+        # Create all domain specialist agents with filtered tools
         for domain_id, domain_config in DOMAINS.items():
+            # Create filtered tool list for this domain using common utility
+            domain_tools = create_filtered_tool_list(
+                base_mcp_tool=base_mcp_tool,
+                allowed_tool_names=domain_config["tools"],
+                agent_name=domain_id
+            )
+            
             agent = ChatAgent(
                 name=domain_id,
                 chat_client=chat_client,
                 instructions=domain_config["instructions"],
-                tools=mcp_tool,
+                tools=domain_tools,  # Pass list of filtered AIFunction objects
                 model=self.openai_model_name,
             )
             
@@ -214,7 +311,7 @@ class Agent(BaseAgent):
                 self._domain_threads[domain_id] = agent.get_new_thread()
 
         self._initialized = True
-        logger.info(f"[HANDOFF] Initialized {len(self._domain_agents)} domain specialists")
+        logger.info(f"[HANDOFF] Initialized {len(self._domain_agents)} domain specialists with filtered tools")
 
     def _build_headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {"Content-Type": "application/json"}
@@ -223,6 +320,14 @@ class Agent(BaseAgent):
         return headers
 
     async def _create_mcp_tool(self, headers: Dict[str, str]) -> MCPStreamableHTTPTool | None:
+        """
+        Create the base MCP tool that will be shared across all domain specialists.
+        
+        The tool will be connected once and then filtered for each domain.
+        
+        Returns:
+            MCPStreamableHTTPTool instance or None if MCP server is not configured
+        """
         if not self.mcp_server_uri:
             logger.warning("MCP_SERVER_URI is not configured; agents will run without MCP tools.")
             return None
@@ -296,23 +401,25 @@ class Agent(BaseAgent):
 
     async def _classify_intent(self, user_message: str, current_domain: str | None) -> Dict[str, Any]:
         """
-        Use a vanilla LLM call to classify user intent and detect domain changes.
+        Use structured output with Pydantic to classify user intent and detect domain changes.
         
+        This uses the beta.chat.completions.parse() API with response_format to ensure
+        robust JSON parsing without validation errors.
+        
+        Args:
+            user_message: The user's message to classify
+            current_domain: Current active domain (or None for first message)
+            
         Returns:
-            {
-                "domain": str,
-                "is_domain_change": bool,
-                "confidence": float,
-                "reasoning": str
-            }
+            Dictionary with keys: domain, is_domain_change, confidence, reasoning
         """
-        # If no current domain, default to crm_billing
+        # If no current domain, route to default domain
         if not current_domain:
             return {
-                "domain": "crm_billing",
+                "domain": self._default_domain,
                 "is_domain_change": True,
                 "confidence": 1.0,
-                "reasoning": "First message, routing to CRM & Billing"
+                "reasoning": f"First message, routing to {self._default_domain}"
             }
 
         # Build classification prompt
@@ -321,44 +428,64 @@ class Agent(BaseAgent):
             user_message=user_message
         )
 
-        # Make direct chat client call (no agent wrapper needed)
-        chat_client = AzureOpenAIChatClient(
-            api_key=self.azure_openai_key,
-            deployment_name=self.azure_deployment,
-            endpoint=self.azure_openai_endpoint,
-            api_version=self.api_version,
-        )
-
         try:
-            messages = [ChatMessage(role=Role.USER, text=prompt)]
-            response = await chat_client.get_response(messages, model=self.openai_model_name)
+            # Use OpenAI client directly for structured output support
+            from openai import AsyncAzureOpenAI
             
-            # Parse JSON response
-            response_text = response.messages[0].text
-            result = json.loads(response_text)
+            client = AsyncAzureOpenAI(
+                api_key=self.azure_openai_key,
+                api_version=self.api_version,
+                azure_endpoint=self.azure_openai_endpoint,
+            )
+            
+            # Use beta API with structured output
+            completion = await client.beta.chat.completions.parse(
+                model=self.azure_deployment,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                response_format=IntentClassification,
+            )
+            
+            # Extract structured result
+            intent = completion.choices[0].message.parsed
+            
+            result = {
+                "domain": intent.domain,
+                "is_domain_change": intent.is_domain_change,
+                "confidence": intent.confidence,
+                "reasoning": intent.reasoning,
+            }
             
             logger.info(f"[HANDOFF] Intent classification: {result}")
             return result
             
         except Exception as exc:
             logger.error(f"[HANDOFF] Intent classification failed: {exc}", exc_info=True)
-            # Default to current domain on error
+            
+            # Fallback: randomly select a different domain (not current)
+            available_domains = [d for d in DOMAINS.keys() if d != current_domain]
+            fallback_domain = random.choice(available_domains) if available_domains else current_domain
+            
+            logger.warning(f"[HANDOFF] Falling back to random domain: {fallback_domain}")
+            
             return {
-                "domain": current_domain,
-                "is_domain_change": False,
-                "confidence": 0.5,
-                "reasoning": "Classification error, staying in current domain"
+                "domain": fallback_domain,
+                "is_domain_change": fallback_domain != current_domain,
+                "confidence": 0.3,
+                "reasoning": f"Classification error, randomly selected {fallback_domain}"
             }
 
     async def chat_async(self, prompt: str) -> str:
         """
-        Main chat entry point with intelligent routing.
+        Main chat entry point with intelligent routing and lazy classification.
         
         Flow:
-        1. Classify user intent
-        2. If domain change detected, announce handoff
-        3. Route to appropriate specialist agent
-        4. Stream response back to user
+        1. If first message OR lazy classification is disabled: classify intent upfront
+        2. If lazy classification enabled: route to current agent first
+        3. Check agent response for handoff markers
+        4. If handoff detected: run intent classification and re-route
+        5. Stream response back to user
         """
         await self._setup_agents()
 
@@ -366,30 +493,43 @@ class Agent(BaseAgent):
         self._current_turn += 1
         self.state_store[self._turn_key] = self._current_turn
 
-        # Classify intent to determine routing
-        intent = await self._classify_intent(prompt, self._current_domain)
-        target_domain = intent["domain"]
-        is_domain_change = intent["is_domain_change"]
-
-        # Announce handoff if domain changed
-        if is_domain_change and self._current_domain:
-            handoff_message = (
-                f"I'll connect you with our {DOMAINS[target_domain]['name']} "
-                f"who can better assist with that."
-            )
+        # Determine if we need upfront classification
+        is_first_message = self._current_domain is None
+        needs_upfront_classification = is_first_message or not self._lazy_classification
+        
+        target_domain = None
+        is_domain_change = False
+        
+        if needs_upfront_classification:
+            # Run intent classification before routing
+            logger.info(f"[HANDOFF] Running upfront classification (first_message={is_first_message}, lazy={self._lazy_classification})")
+            intent = await self._classify_intent(prompt, self._current_domain)
+            target_domain = intent["domain"]
+            is_domain_change = intent["is_domain_change"]
             
-            if self._ws_manager:
-                await self._ws_manager.broadcast(
-                    self.session_id,
-                    {
-                        "type": "handoff_announcement",
-                        "from_domain": self._current_domain,
-                        "to_domain": target_domain,
-                        "message": handoff_message,
-                    },
+            # Announce handoff if domain changed
+            if is_domain_change and self._current_domain:
+                handoff_message = (
+                    f"I'll connect you with our {DOMAINS[target_domain]['name']} "
+                    f"who can better assist with that."
                 )
-            
-            logger.info(f"[HANDOFF] Domain change: {self._current_domain} -> {target_domain}")
+                
+                if self._ws_manager:
+                    await self._ws_manager.broadcast(
+                        self.session_id,
+                        {
+                            "type": "handoff_announcement",
+                            "from_domain": self._current_domain,
+                            "to_domain": target_domain,
+                            "message": handoff_message,
+                        },
+                    )
+                
+                logger.info(f"[HANDOFF] Domain change: {self._current_domain} -> {target_domain}")
+        else:
+            # Lazy mode: use current domain (will check response for handoff markers)
+            target_domain = self._current_domain
+            logger.info(f"[HANDOFF] Using lazy classification, routing to current domain: {target_domain}")
 
         # Update current domain
         previous_domain = self._current_domain
@@ -461,6 +601,97 @@ class Agent(BaseAgent):
             raise
 
         assistant_response = ''.join(full_response)
+
+        # Check if lazy classification is enabled and handoff was requested
+        if self._lazy_classification and self._detect_handoff_request(assistant_response):
+            logger.info(f"[HANDOFF] Handoff marker detected in response, running intent classification")
+            
+            # Run intent classification to determine new domain
+            intent = await self._classify_intent(prompt, target_domain)
+            new_target_domain = intent["domain"]
+            
+            if new_target_domain != target_domain:
+                logger.info(f"[HANDOFF] Re-routing from {target_domain} to {new_target_domain}")
+                
+                # Update domain
+                self._current_domain = new_target_domain
+                self.state_store[f"{self.session_id}_current_domain"] = new_target_domain
+                
+                # Announce handoff
+                handoff_message = (
+                    f"I'll connect you with our {DOMAINS[new_target_domain]['name']} "
+                    f"who can better assist with that."
+                )
+                
+                if self._ws_manager:
+                    await self._ws_manager.broadcast(
+                        self.session_id,
+                        {
+                            "type": "handoff_announcement",
+                            "from_domain": target_domain,
+                            "to_domain": new_target_domain,
+                            "message": handoff_message,
+                        },
+                    )
+                
+                # Get new agent and thread
+                new_agent = self._domain_agents[new_target_domain]
+                new_thread = self._domain_threads[new_target_domain]
+                
+                # Build context prefix
+                context_prefix = await self._build_context_prefix(target_domain, new_target_domain)
+                actual_prompt_handoff = f"{context_prefix}\n\n{prompt}" if context_prefix else prompt
+                
+                # Notify UI
+                if self._ws_manager:
+                    await self._ws_manager.broadcast(
+                        self.session_id,
+                        {
+                            "type": "agent_start",
+                            "agent_id": new_target_domain,
+                            "agent_name": DOMAINS[new_target_domain]["name"],
+                            "show_message_in_internal_process": True,
+                        },
+                    )
+                
+                # Get response from new agent
+                full_response_handoff = []
+                try:
+                    async for chunk in new_agent.run_stream(actual_prompt_handoff, thread=new_thread):
+                        if hasattr(chunk, 'contents') and chunk.contents:
+                            for content in chunk.contents:
+                                if content.type == "function_call":
+                                    if self._ws_manager:
+                                        await self._ws_manager.broadcast(
+                                            self.session_id,
+                                            {
+                                                "type": "tool_called",
+                                                "agent_id": new_target_domain,
+                                                "tool_name": content.name,
+                                                "turn": self._current_turn,
+                                            },
+                                        )
+                        
+                        if hasattr(chunk, 'text') and chunk.text:
+                            full_response_handoff.append(chunk.text)
+                            
+                            if self._ws_manager:
+                                await self._ws_manager.broadcast(
+                                    self.session_id,
+                                    {
+                                        "type": "agent_token",
+                                        "agent_id": new_target_domain,
+                                        "content": chunk.text,
+                                    },
+                                )
+                except Exception as exc:
+                    logger.error(f"[HANDOFF] Error during handoff agent streaming: {exc}", exc_info=True)
+                    raise
+                
+                # Use handoff response
+                assistant_response = ''.join(full_response_handoff)
+                target_domain = new_target_domain
+                thread = new_thread
 
         # Send final result
         if self._ws_manager:

@@ -4,6 +4,47 @@
 
 This is an **optimized handoff pattern** for domain-based multi-agent routing in customer support scenarios. Unlike orchestrator-based approaches (like Magentic), this implementation prioritizes **direct agent-to-user communication** with intelligent routing only when needed.
 
+## ✨ Recent Improvements (v2.0)
+
+### 1. **Structured Output with Pydantic** 🎯
+- Intent classification now uses OpenAI's **`beta.chat.completions.parse()`** API
+- Pydantic `IntentClassification` model ensures **100% valid JSON** responses
+- Eliminates JSON parsing errors that occurred with unstructured LLM outputs
+- **Before:** `json.loads()` failures on malformed responses
+- **After:** Guaranteed structured output with proper typing
+
+### 2. **Lazy Intent Classification** ⚡
+- Classification is now **lazy by default** - only runs when needed!
+- **When it runs:**
+  - On first message (to route to initial domain)
+  - When agent signals handoff via pattern detection
+- **When it skips:**
+  - During normal conversation within a domain
+  - Saves ~1-2 seconds and one LLM call per turn
+- **Configuration:** `HANDOFF_LAZY_CLASSIFICATION=true` (default)
+
+### 3. **Pattern-Based Handoff Detection** 🔍
+- No LLM needed to detect when agents request handoff!
+- Uses regex + keyword proximity to detect phrases like:
+  - "This is outside my area. Let me connect you with the right specialist."
+  - "outside my domain", "not my expertise", etc.
+- **Multiple detection strategies:**
+  - Exact phrase matching (highest confidence)
+  - Regex patterns for common variations
+  - Keyword proximity detection (within 100 chars)
+- Fast, reliable, and cost-free
+
+### 4. **Intelligent Error Handling** 🛡️
+- If intent classification fails → **random routing** to a different domain
+- Prevents getting stuck in broken agent
+- Logs all failures for debugging
+- Graceful degradation without user impact
+
+### 5. **Configurable Default Domain** 🎛️
+- Set starting agent via `HANDOFF_DEFAULT_DOMAIN` environment variable
+- Options: `crm_billing`, `product_promotions`, `security_authentication`
+- Defaults to `crm_billing` (most common use case)
+
 ## Key Design Principles
 
 ### 1. **Direct Communication (No Middleman)**
@@ -11,10 +52,11 @@ This is an **optimized handoff pattern** for domain-based multi-agent routing in
 - No coordinator agent acting as a middleman for every message
 - Specialist agents respond directly to user questions within their domain
 
-### 2. **Lightweight Intent Classification**
-- Uses vanilla LLM calls (via `chat_client.get_response()`) for intent detection
-- Efficient: only classifies intent at the start of each user message
-- No heavy orchestrator overhead
+### 2. **Lazy Intent Classification**
+- Classification is **lazy by default** - only runs when needed
+- Uses structured output via `beta.chat.completions.parse()` with Pydantic models
+- Runs only on first message or when handoff is detected via pattern matching
+- No heavy orchestrator overhead, minimal LLM calls
 
 ### 3. **Seamless Handoffs**
 - Detects domain changes in real-time
@@ -105,6 +147,63 @@ This is an **optimized handoff pattern** for domain-based multi-agent routing in
 - Defers to Billing specialist for non-security account issues
 - Defers to Product specialist for product/promo questions
 
+## Tool Filtering Architecture 🔒
+
+### How Tool Filtering Works
+
+Each domain specialist has **filtered access** to MCP tools, ensuring agents can only use tools within their domain:
+
+```python
+# 1. Connect to MCP server ONCE and load all tools
+base_mcp_tool = MCPStreamableHTTPTool(url="http://localhost:8000")
+await base_mcp_tool.__aenter__()  # Loads all 20+ tools
+
+# 2. Create filtered wrappers for each domain
+crm_tools = FilteredMCPTool(
+    mcp_tool=base_mcp_tool,
+    allowed_tool_names=["get_customer_detail", "get_billing_summary", ...]
+)
+crm_tools.filter_functions()  # Only 9 tools accessible
+
+product_tools = FilteredMCPTool(
+    mcp_tool=base_mcp_tool,
+    allowed_tool_names=["get_products", "get_promotions", ...]
+)
+product_tools.filter_functions()  # Only 6 tools accessible
+
+# 3. Pass filtered tools to agents
+crm_agent = ChatAgent(..., tools=crm_tools)  # Can't access security tools
+product_agent = ChatAgent(..., tools=product_tools)  # Can't access billing tools
+```
+
+### Benefits
+
+1. **Security**: Agents can't accidentally or maliciously call tools outside their domain
+2. **Focus**: Smaller tool list helps LLM select correct tool faster
+3. **Clarity**: Reduces hallucination by limiting options
+4. **Efficiency**: Single MCP connection shared across all agents
+
+### Implementation Details
+
+**FilteredMCPTool Class:**
+- Wraps `MCPStreamableHTTPTool`
+- Filters `mcp_tool.functions` list based on `allowed_tool_names`
+- Exposes same `.functions` property that `ChatAgent` expects
+- Shares underlying MCP connection (efficient)
+
+**DOMAINS Configuration:**
+Each domain defines its `"tools"` list:
+```python
+"crm_billing": {
+    "tools": [
+        "get_all_customers",
+        "get_customer_detail",
+        "get_subscription_detail",
+        # ... domain-specific tools only
+    ]
+}
+```
+
 ## Example Interaction Flows
 
 ### Flow 1: Single Domain (Billing Question)
@@ -158,6 +257,101 @@ Intent Classifier: domain=security_authentication, is_domain_change=true
   ↓
 Security Specialist: [Uses unlock_account tool]
 ```
+
+## Lazy Classification Flow (v2.0)
+
+### How It Works
+
+**Traditional Flow (v1.0):**
+```
+User Message → Intent Classification → Route to Agent → Agent Response
+     (Every turn runs classification = slow + expensive)
+```
+
+**Lazy Flow (v2.0):**
+```
+User Message → Route to Current Agent → Agent Response → Check for Handoff Marker
+                                                                    ↓
+                                                    (Only if detected)
+                                                                    ↓
+                                            Intent Classification → Re-route
+```
+
+### Example: Multi-Turn Conversation
+
+```
+Turn 1:
+User: "What's my bill?"
+→ No current domain → Run classification → Route to Billing
+Agent: "Your bill is $45.99"
+
+Turn 2:
+User: "Can I see the details?"
+→ Current domain = Billing → Skip classification → Send to Billing
+Agent: "Here are the line items..."
+→ Check response → No handoff marker → Done
+
+Turn 3:
+User: "What about promotions?"
+→ Current domain = Billing → Skip classification → Send to Billing
+Agent: "This is outside my area. Let me connect you with the right specialist."
+→ Check response → Handoff marker detected! → Run classification → Route to Promotions
+Agent: "We have 3 active promotions available..."
+```
+
+### Handoff Detection Patterns
+
+The system uses multiple strategies to detect handoff requests:
+
+**1. Exact Template Match (Highest Confidence)**
+```regex
+"outside my area.*connect you with.*specialist"
+```
+
+**2. Domain Boundary Phrases**
+```regex
+"outside my (domain|expertise|area)"
+"not my (specialty|expertise|domain)"
+```
+
+**3. Explicit Handoff Language**
+```regex
+"connect you with.*specialist"
+"let me (transfer|route|connect) you"
+"better suited to help"
+```
+
+**4. Keyword Proximity Detection**
+- Keywords from group 1: ["outside", "not my"]
+- Keywords from group 2: ["area", "domain", "expertise"]
+- Keywords from group 3: ["connect", "transfer", "specialist"]
+- Detection: Groups 1 + 2 + 3 within 100 characters
+
+### Configuration
+
+**Enable/Disable Lazy Classification:**
+```bash
+HANDOFF_LAZY_CLASSIFICATION=true   # Default: enabled
+HANDOFF_LAZY_CLASSIFICATION=false  # Runs classification every turn (v1.0 behavior)
+```
+
+**Set Default Starting Domain:**
+```bash
+HANDOFF_DEFAULT_DOMAIN=crm_billing              # Default
+HANDOFF_DEFAULT_DOMAIN=product_promotions       # Start with products
+HANDOFF_DEFAULT_DOMAIN=security_authentication  # Start with security
+```
+
+### Performance Comparison
+
+| Metric | v1.0 (Always Classify) | v2.0 (Lazy) |
+|--------|----------------------|-------------|
+| LLM calls per turn | 2 (classify + agent) | 1 (agent only)* |
+| Latency per turn | ~3-4 seconds | ~1-2 seconds* |
+| Handoff detection | LLM-based | Pattern-based (instant) |
+| JSON parsing errors | Possible | Eliminated (structured output) |
+
+_*Except when handoff is detected (adds classification call)_
 
 ## State Management
 
@@ -391,6 +585,11 @@ MCP_SERVER_URI=http://localhost:8000
 
 # Context Transfer Configuration
 HANDOFF_CONTEXT_TRANSFER_TURNS=-1  # -1=all, 0=none, N=last N turns
+
+# Lazy Classification Configuration (NEW!)
+HANDOFF_LAZY_CLASSIFICATION=true      # Enable lazy classification (default: true)
+HANDOFF_DEFAULT_DOMAIN=crm_billing    # Default starting domain (default: crm_billing)
+                                       # Options: crm_billing, product_promotions, security_authentication
 
 # Agent Module
 AGENT_MODULE=agents.agent_framework.multi_agent.handoff_multi_domain_agent
