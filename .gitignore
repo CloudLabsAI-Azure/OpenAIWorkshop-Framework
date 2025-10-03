@@ -1,6 +1,7 @@
 # Azure az webapp deployment details
 .azure
 *_env
+.env2
 OAI_CONFIG_LIST
 # Byte-compiled / optimized / DLL files
 __pycache__/
