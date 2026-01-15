@@ -13,12 +13,10 @@ from agent_framework import (
     WorkflowCheckpoint,
     WorkflowOutputEvent,
     CheckpointStorage,
-    MagenticCallbackEvent,
-    MagenticCallbackMode,
-    MagenticOrchestratorMessageEvent,
-    MagenticAgentDeltaEvent,
-    MagenticAgentMessageEvent,
-    MagenticFinalResultEvent,
+    AgentRunUpdateEvent,
+    AgentRunEvent,
+    MAGENTIC_EVENT_TYPE_ORCHESTRATOR,
+    MAGENTIC_EVENT_TYPE_AGENT_DELTA,
 )
 from agent_framework.azure import AzureOpenAIChatClient  # type: ignore[import]
 
@@ -358,12 +356,28 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
         return self._manager_client
 
     def _build_chat_client(self) -> AzureOpenAIChatClient:
-        return AzureOpenAIChatClient(
-            api_key=self.azure_openai_key,
-            deployment_name=self.azure_deployment,
-            endpoint=self.azure_openai_endpoint,
-            api_version=self.api_version,
-        )
+        # Use API key if available, otherwise use credential-based authentication
+        if self.azure_openai_key:
+            logger.info("[AgentFramework-Magentic] Using API key authentication for Azure OpenAI")
+            return AzureOpenAIChatClient(
+                api_key=self.azure_openai_key,
+                deployment_name=self.azure_deployment,
+                endpoint=self.azure_openai_endpoint,
+                api_version=self.api_version,
+            )
+        elif self.azure_credential:
+            logger.info("[AgentFramework-Magentic] Using managed identity authentication for Azure OpenAI")
+            return AzureOpenAIChatClient(
+                credential=self.azure_credential,
+                deployment_name=self.azure_deployment,
+                endpoint=self.azure_openai_endpoint,
+                api_version=self.api_version,
+            )
+        else:
+            raise RuntimeError(
+                "Azure OpenAI authentication is not configured. Either set AZURE_OPENAI_API_KEY "
+                "or ensure managed identity is available for credential-based authentication."
+            )
 
     async def _resume_previous_run(
         self,
@@ -423,22 +437,22 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
 
         builder = MagenticBuilder().participants(**participants)
         
-        # Register streaming callback if WebSocket is available (MUST be before with_standard_manager)
+        # Note: Streaming is now handled in _run_workflow by processing events from run_stream()
         if self._ws_manager:
-            logger.info(f"[STREAMING] Registering streaming callback for magentic events, session_id={self.session_id}")
-            logger.info(f"[STREAMING] WebSocket manager type: {type(self._ws_manager)}")
-            logger.info(f"[STREAMING] Callback function: {self._stream_magentic_event}")
-            builder = builder.on_event(self._stream_magentic_event, mode=MagenticCallbackMode.STREAMING)
-            logger.info("[STREAMING] Callback registered successfully")
-        elif self._workflow_event_logging_enabled:
-            logger.info("[STREAMING] Using workflow event logging instead of streaming")
-            builder = builder.on_event(self._log_workflow_event)
+            logger.info(f"[STREAMING] WebSocket manager available for session_id={self.session_id}")
+            logger.info("[STREAMING] Events will be streamed via run_stream() processing")
+        
+        # Create manager agent for the StandardMagenticManager
+        manager_agent = ChatAgent(
+            chat_client=manager_client,
+            name="magentic_manager",
+            instructions=self._manager_instructions,
+        )
         
         builder = (
             builder
             .with_standard_manager(
-                chat_client=manager_client,
-                instructions=self._manager_instructions,
+                agent=manager_agent,
                 max_round_count=self._max_round_count,
                 max_stall_count=self._max_stall_count,
                 max_reset_count=self._max_reset_count,
@@ -621,114 +635,102 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
 
         try:
             if checkpoint_id:
-                async for event in workflow.run_stream_from_checkpoint(checkpoint_id, checkpoint_storage):
-                    if isinstance(event, WorkflowOutputEvent):
-                        final_answer = self._extract_text_from_event(event)
+                event_stream = workflow.run_stream_from_checkpoint(checkpoint_id, checkpoint_storage)
             else:
-                async for event in workflow.run_stream(task):
-                    if isinstance(event, WorkflowOutputEvent):
-                        final_answer = self._extract_text_from_event(event)
+                event_stream = workflow.run_stream(task)
+            
+            async for event in event_stream:
+                # Stream events to WebSocket if available
+                await self._process_workflow_event(event)
+                
+                if isinstance(event, WorkflowOutputEvent):
+                    final_answer = self._extract_text_from_event(event)
         except Exception as exc:
             logger.error("[AgentFramework-Magentic] workflow failure: %s", exc, exc_info=True)
             return None
 
         return final_answer
 
-    @staticmethod
-    def _extract_text_from_event(event: WorkflowOutputEvent) -> str:
-        data = event.data
-        if hasattr(data, "text") and getattr(data, "text"):
-            return str(getattr(data, "text"))
-        return str(data)
-
-    async def _log_workflow_event(self, event: Any) -> None:
-        if isinstance(event, WorkflowOutputEvent):
-            logger.debug("[AgentFramework-Magentic] Workflow output event: %s", event.data)
-        else:
-            logger.debug("[AgentFramework-Magentic] Workflow event emitted: %s", getattr(event, "name", type(event).__name__))
-
-    async def _stream_magentic_event(self, event: MagenticCallbackEvent) -> None:
-        """Stream Magentic workflow events to WebSocket clients."""
+    async def _process_workflow_event(self, event: Any) -> None:
+        """Process workflow events and stream to WebSocket clients."""
         if not self._ws_manager:
+            # Just log if no WebSocket manager
+            if self._workflow_event_logging_enabled:
+                await self._log_workflow_event(event)
             return
 
         try:
-            if isinstance(event, MagenticOrchestratorMessageEvent):
-                # Manager/orchestrator thinking or planning
-                message_text = getattr(event.message, "text", "") if event.message else ""
-                await self._ws_manager.broadcast(
-                    self.session_id,
-                    {
-                        "type": "orchestrator",
-                        "kind": event.kind,  # e.g., "plan", "progress", "result"
-                        "content": message_text,
-                    },
-                )
-
-            elif isinstance(event, MagenticAgentDeltaEvent):
-                # Streaming token from participant agent
-                if self._stream_agent_id != event.agent_id or not self._stream_line_open:
-                    self._stream_agent_id = event.agent_id
-                    self._stream_line_open = True
+            # Handle AgentRunUpdateEvent (streaming tokens and orchestrator messages)
+            if isinstance(event, AgentRunUpdateEvent) and event.data:
+                props = getattr(event.data, "additional_properties", None) or {}
+                event_type = props.get("magentic_event_type")
+                
+                if event_type == MAGENTIC_EVENT_TYPE_ORCHESTRATOR:
+                    # Manager/orchestrator thinking or planning
+                    message_text = getattr(event.data, "text", "") or ""
+                    kind = props.get("orchestrator_message_kind", "")
                     await self._ws_manager.broadcast(
                         self.session_id,
                         {
-                            "type": "agent_start",
-                            "agent_id": event.agent_id,
-                            "show_message_in_internal_process": True,  # Convention: show full agent details
-                        },
-                    )
-
-                # Check for tool/function calls in the delta event
-                if event.function_call_name:
-                    await self._ws_manager.broadcast(
-                        self.session_id,
-                        {
-                            "type": "tool_called",
-                            "agent_id": event.agent_id,
-                            "tool_name": event.function_call_name,
-                        },
-                    )
-
-                # Stream text tokens
-                if event.text:
-                    await self._ws_manager.broadcast(
-                        self.session_id,
-                        {
-                            "type": "agent_token",
-                            "agent_id": event.agent_id,
-                            "content": event.text,
-                        },
-                    )
-
-            elif isinstance(event, MagenticAgentMessageEvent):
-                # Complete message from participant
-                if self._stream_line_open:
-                    self._stream_line_open = False
-
-                msg = event.message
-                if msg:
-                    message_text = getattr(msg, "text", "")
-                    role = getattr(msg, "role", None)
-                    
-                    # Store last agent message for deduplication with final result
-                    self._last_agent_message = message_text
-                    
-                    await self._ws_manager.broadcast(
-                        self.session_id,
-                        {
-                            "type": "agent_message",
-                            "agent_id": event.agent_id,
-                            "role": role.value if role else "assistant",
+                            "type": "orchestrator",
+                            "kind": kind,
                             "content": message_text,
                         },
                     )
-
-            elif isinstance(event, MagenticFinalResultEvent):
-                # Final workflow result - skip if identical to last agent message
-                final_text = getattr(event.message, "text", "") if event.message else ""
                 
-                # Sanitize the final text to remove FINAL_ANSWER prefix
+                elif event_type == MAGENTIC_EVENT_TYPE_AGENT_DELTA:
+                    # Streaming token from participant agent
+                    agent_id = event.executor_id
+                    
+                    if self._stream_agent_id != agent_id or not self._stream_line_open:
+                        self._stream_agent_id = agent_id
+                        self._stream_line_open = True
+                        await self._ws_manager.broadcast(
+                            self.session_id,
+                            {
+                                "type": "agent_start",
+                                "agent_id": agent_id,
+                                "show_message_in_internal_process": True,
+                            },
+                        )
+                    
+                    # Stream text tokens
+                    text = getattr(event.data, "text", "") or ""
+                    if text:
+                        await self._ws_manager.broadcast(
+                            self.session_id,
+                            {
+                                "type": "agent_token",
+                                "agent_id": agent_id,
+                                "content": text,
+                            },
+                        )
+            
+            # Handle AgentRunEvent (complete agent response)
+            elif isinstance(event, AgentRunEvent) and event.data:
+                if self._stream_line_open:
+                    self._stream_line_open = False
+                
+                agent_id = event.executor_id
+                message_text = getattr(event.data, "text", "") or ""
+                role = getattr(event.data, "role", None)
+                
+                # Store last agent message for deduplication with final result
+                self._last_agent_message = message_text
+                
+                await self._ws_manager.broadcast(
+                    self.session_id,
+                    {
+                        "type": "agent_message",
+                        "agent_id": agent_id,
+                        "role": role.value if role else "assistant",
+                        "content": message_text,
+                    },
+                )
+            
+            # Handle WorkflowOutputEvent (final result)
+            elif isinstance(event, WorkflowOutputEvent):
+                final_text = self._extract_text_from_event(event)
                 cleaned_final_text = self._sanitize_final_answer(final_text) or final_text
                 
                 # Only send if different from the last agent message
@@ -747,7 +749,56 @@ DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
                 self._last_agent_message = None
 
         except Exception as exc:
-            logger.error("[AgentFramework-Magentic] Failed to stream event: %s", exc, exc_info=True)
+            logger.error("[AgentFramework-Magentic] Failed to process event: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _extract_text_from_event(event: WorkflowOutputEvent) -> str:
+        """Extract text content from WorkflowOutputEvent data.
+        
+        Handles various data formats:
+        - Single ChatMessage object with .text attribute
+        - List of ChatMessage objects
+        - AgentRunResponse with .text attribute
+        - Plain string
+        """
+        data = event.data
+        
+        # Handle list of messages (common for Magentic workflow output)
+        if isinstance(data, list):
+            texts = []
+            for item in data:
+                if hasattr(item, "text") and getattr(item, "text"):
+                    texts.append(str(getattr(item, "text")))
+                elif isinstance(item, str):
+                    texts.append(item)
+            if texts:
+                return "\n".join(texts)
+            # Fallback: stringify the list
+            return str(data)
+        
+        # Handle single object with text attribute
+        if hasattr(data, "text") and getattr(data, "text"):
+            return str(getattr(data, "text"))
+        
+        # Handle AgentRunResponse which may have messages
+        if hasattr(data, "messages") and getattr(data, "messages"):
+            messages = getattr(data, "messages")
+            if isinstance(messages, list):
+                texts = []
+                for msg in messages:
+                    if hasattr(msg, "text") and getattr(msg, "text"):
+                        texts.append(str(getattr(msg, "text")))
+                if texts:
+                    return "\n".join(texts)
+        
+        # Fallback: convert to string
+        return str(data)
+
+    async def _log_workflow_event(self, event: Any) -> None:
+        if isinstance(event, WorkflowOutputEvent):
+            logger.debug("[AgentFramework-Magentic] Workflow output event: %s", event.data)
+        else:
+            logger.debug("[AgentFramework-Magentic] Workflow event emitted: %s", getattr(event, "name", type(event).__name__))
 
     def _render_task_with_history(self, prompt: str) -> str:
         if not self.chat_history:
