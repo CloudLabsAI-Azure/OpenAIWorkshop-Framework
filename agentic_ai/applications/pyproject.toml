@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "agent-framework",
+    "agent-framework==1.0.0b260107",
     "autogen-agentchat==0.7.1",
     "autogen-ext[mcp]==0.7.1",
     "azure-cosmos==4.9.0",
@@ -14,7 +14,7 @@ dependencies = [
     "flask==3.0.3",
     "httpx==0.28.1",
     "msal==1.31.0",
-    "openai>=1.99.0",
+    "openai>=2.5.0",
     "pydantic==2.11.4",
     "python-dotenv>=1.1.1",
     "requests==2.32.4",
